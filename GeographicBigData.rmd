@@ -1,0 +1,996 @@
+
+---
+title: "Processing big geographic data sets with R"
+author: "Manuel Campagnolo (ISA/ULisboa)"
+date: "October, 2018"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  html_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: yes
+    self_contained: no
+subtitle: Introduction and two working examples
+---
+
+
+
+
+```{r setup, include=FALSE, purl=FALSE}
+options(width=80)
+knitr::opts_chunk$set(comment = "", warning = FALSE, message = FALSE, echo = TRUE, tidy = TRUE, size="small", cache=FALSE, eval=TRUE)
+```
+
+
+# Packages
+```{r}
+library(rgdal) # read/write and convert formats with GDAL
+library(sp) # vector data 
+library(sf) # vector data (replaces sp)
+library(mapview) #mapview, viewRGB
+library(raster) # raster data
+library(RANN) # fast nearest neighbors: nn2
+library(data.table) # data tables, fread, fwrite
+library(velox) # alternative to raster
+library(fasterize) # fast resampling
+library(viridisLite) # colors (used in mapview)
+library(tidyverse) #  contains dplyr, magrittr
+library(date) # convert date formats
+library(igraph) # graphs
+library(randomcoloR) # color palettes
+library(concaveman) # relaxation of convex hull
+library(stplanr) # create graph from spatial data set
+```
+
+*Note*: The current document is generated with *knitr*. However '*It is more than questionable whether knitr is an appropriate way to create an html file for such big data sets. knitr stores everything (geometries and attributes) in one html file which will likely get very big very quickly and become rather unresponsive*' 
+<https://stackoverflow.com/questions/34331964/mapview-error-in-knitr-r-markdown-document/34354807>. To attenuate this problem, plotting extensive maps is avoided. Examples are typically illustrated by cropping the data to a small or medium size region. This document was created with `r R.Version()$version.string`.
+
+
+<!--
+Comments:
+
+# install.packages("fasterize", repos = "http://cran.us.r-project.org")
+
+setwd("\\\\madpet\\mlc\\Aulas\\CURSOS_R\\isa-setembro-2018-grandes-cdg\\aulas")
+
+input<-'big-data-read-files.rmd';
+outputR <- paste(tools::file_path_sans_ext(input), 'R', sep = '.');
+outputhtml <- paste(tools::file_path_sans_ext(input), 'html', sep = '.');
+
+to run from command line:
+rmarkdown::render('big-data-read-files.rmd',output_file='big-data-read-files.html')
+
+to create r code and comment everything else:
+> knitr::purl(input,outputR,documentation=2,quiet=T)
+
+To interrupt processing use the following chunck:
+```{r, echo=FALSE}
+#knitr::knit_exit()
+```
+-->
+
+```{r, echo=FALSE}
+#if (Sys.info()["nodename"]=="DESKTOP-52DTEKH") setwd("D:\\isa-setembro-2018-grandes-cdg\\aulas") 
+#if (Sys.info()["nodename"]=="DMMLC") setwd("\\\\madpet\\mlc\\Aulas\\CURSOS_R\\isa-setembro-2018-grandes-cdg\\aulas") 
+library(knitr)
+library(formatR) #reformat R code to improve readability
+```
+
+# Introduction: R packages for large geographic data sets
+
+This short introduction shows how to read, write and display large geographic data sets with R. A very complete and easy to follow on-line resource is the eBook by [Lovelace, Nowosad and  Muenchow](https://geocompr.robinlovelace.net/). Package *sp* has been the main package to process vector spatial data, but it is being progressively abandoned in favour of the more recent  package *sf* [Simple Features for R](https://r-spatial.github.io/sf/articles/sf1.html). For *raster* data, package *raster* is still widely used, although some alternatives are available. 
+
+
+## Vector data: the *sf* package
+
+Let's first understand how geographic data are structured in *sf*. In order to do this let's define some simple polygons and build a couple of *sf* objects using those polygons. Polygons are just 2-column matrices of coordinates where each row represents a vertex. One can also define a *list* of polygons: the first polygon in the list will be the exterior *ring* of the spatial region, and the following polygons will define *holes*. We suppose that the holes are in the interior of the region enclosed in the external ring and, therefore, each list represents a *spatially connected* region on the plane.
+
+```{r, echo=TRUE}
+p1 <- rbind(c(0,0),c(4,0),c(4,4),c(0,4),c(0,0)) # polygon
+hole1 <- rbind(c(1,1),c(3,1),c(3,3),c(1,3),c(1,1)) # polygon
+P1<-list(p1,hole1) # list of polygons
+p2 <- rbind(c(5+0,0),c(5+4,0),c(5+4,4),c(5+0,4),c(5+0,0))
+hole2 <- rbind(c(5+1,1),c(5+3,1),c(5+3,3),c(5+1,3),c(5+1,1))
+P2<-list(p2,hole2)
+p3 <- rbind(c(5+1,4+1),c(5+3,4+1),c(5+3,4+3),c(5+1,4+3),c(5+1,4+1))
+P3<-list(p3)
+```
+Let's now define a first *sf* object with three *features*. Each feature corresponds to a spatially connected region as defined above. Moreover, each feature can have *attributes* with values. Here we consider just one attribute named *code*.
+```{r, echo=TRUE}
+mysf <- st_sf(code = c(1:3),
+              geometry = st_sfc(list(st_polygon(P1),st_polygon(P2), st_polygon(P3)))) 
+mysf
+```
+At this point, there is no coordinate reference system associated to the data set. One main feature of *sf* objects is that they are organized as tables (it is a *tidy* format) where each row corresponds to one single feature and with a special column called *geometry* that determines the geometry of each feature. In the example above, all features have the same geometric type with is POLYGON, which implies, in particular, that every feature is spatially connected. Function *st_coordinates* not only returns the coordinates of all vertices, but also indicates the index of the feature (L2) and the index of the ring (L1)  for each one of them.
+
+```{r, echo=TRUE}
+st_coordinates(mysf)[c(5,6,10,11),]
+```
+
+Now, let's consider a new way of representing the same region, but now with only two features, where the second feature represents both objects P2 and P3. This new feature is not spatially connected anymore, since P2 and P3 do not intersect: it is of geometric type MULTIPOLYGON, which is a collection of objects of type POLYGON.
+
+```{r, echo=TRUE}
+mymsf <- st_sf(value = c(1:2),
+              geometry = st_sfc(list(st_polygon(P1),st_multipolygon(list(P2,P3)))))
+st_geometry_type(mymsf)
+```
+
+Since *mymsf* is of mixed type (we say that it is a COLLECTION), we cannot extract all its coordinates at once. However, *sf* contains an extremely useful function called *st_cast* that converts from one geometric type to a more complex one, allowing us to easily convert *mymsf* into a new object of single type MULTIPOLYGON.
+
+```{r, echo=TRUE}
+newsf<-st_cast(mymsf,to="MULTIPOLYGON")
+st_geometry_type(newsf)
+st_coordinates(newsf)[c(5,6,20,21),]
+```
+Note that there are now three levels for each vertex: the ring to which it belongs (L1), the part (L2) and the feature (L3).
+
+To complete the definition of the *sf* objects and to be able to combine them with other geographical data sets, we need to associate a coordinate reference system to the data. In particular, this allows us to map the data with *mapview*.
+```{r, echo=TRUE}
+st_crs(newsf)<-4326 # WGS84, which is non sense
+# or
+st_crs(newsf)<-"+proj=laea +lon_0=3.85621 +lat_0=43.61868 +x_0=0 +y_0=0 +ellps=WGS84 +units=m" # custom projection
+mapview(newsf)
+```
+
+So far, we have been dealing with a toy data set with a few vertices to understand what is the data structure of *sf* geographical objects. Next, we will compare *sf* and the older package *sp* in terms of reading/writing speed, and conclude that *sf* is much more efficient for large data sets.
+
+
+Toward that end, we consider a reasonably large shapefile: this is a subset of classes of the land cover map for Portugal COS2015 (from the Portuguese agency for the territory, DGT) and corresponds to the *flammable* class: these are the areas in Continental Portugal that are labelled essentially as "floresta" (forest), "matos" (wild vegetation) e "vegetacao esparsa" (sparse vegetation). Below, we compare the elapsed time to read the shapefile with *rgdal::readOGR*, which returns a *sp* object in R, and with *sf::st_read* that returns a *sf* object. For large data sets,  *st_read* is much faster.
+
+```{r}
+system.time({flam.sp<-rgdal::readOGR(dsn=file.path(getwd(),"datasets"),layer="Flam2015v4",verbose = FALSE)}) # 21.27 
+flam.sp
+```
+
+```{r}
+system.time({flam.sf<-sf::st_read(dsn=file.path(getwd(),"datasets","Flam2015v4.shp"),quiet=TRUE)}) # 4.32
+print(flam.sf,n=5)
+```
+
+
+A *sf* object has a table structure. The attribute table of the data is extended with a special column called *geometry*. 
+The remaining columns of the table are feature's attributes, which each row of the table describes one feature. The main simple feature geometry types are  *POINT*, *LINESTRING*, *POLYGON*, *MULTIPOINT*, *MULTILINESTRING*, *MULTIPOLYGON* and *GEOMETRYCOLLECTION* as the mixed type. The geometry of features in a *sp* object can be extracted with function *st_geometry*, which returns a list of the geometries of all features (the list is an object of class *sfc*, for simple feature geometry list-column). 
+
+If one relies on packages that only can be applied to *sp* objects, it can be useful to convert objects from *sf* to *sp* and vice-versa. This can be done with the following commands:
+```{r,eval=FALSE}
+as(x, "Spatial") # x is a sf object
+st_as_sf(x) # x is a sp object
+```
+
+Let's use *sf* functions for some data exploration. For instance, one may want to select a medium size feature in *flam*. This can easily be done with *st_area* that returns the areas of the features. In fact, package *sf* supports all spatial methods of the GIS standard ISO 19125-1:2004.
+
+```{r}
+areas<-st_area(flam.sf)
+medflam<-flam.sf[areas==quantile(areas,probs=0.5,type=1),]
+```
+
+There are many ways of displaying vector data sets -- see [sf vignette](https://cran.r-project.org/web/packages/sf/vignettes/sf5.html).
+To display geographic data sets interactively in the viewer window, and combine them with background information, one can  use *mapview*. 
+
+```{r, eval=TRUE}
+mapview(medflam)
+```
+
+Another common task is to combine several data geographic data sets, possibly with distinct coordinate reference system. Let's first read the administrative map of Portugal. We can see from the output of *print* that the POLYGON type data set has  attributes *DICOFRE* (code of the administrative unit), *Freguesia* (name of the lowest level administrative unit), *Concelho* (name of the middle level administrative unit), *Distrito* (name of the highest level administrative unit), and a few more attributes. The last column of the attribute table is the designated *geometry* column which determines the location and spatial structure of features.
+
+```{r, eval=TRUE}
+caop<-sf::st_read(dsn=file.path(getwd(),"datasets","Cont_AAD_CAOP2015.shp"),quiet=TRUE)
+print(caop,n=3)
+```
+Next, we want to determine the flammable areas that intersect some administrative unit. Here, we consider "concelho de Monchique", an administrative unit in the South of Portugal which was hit by large fires in the summer of 2018. The steps that we follow are: 1. read administrative units (see above); 2. re-project the administrative unit map to the coordinates of *flam*; 3. select "Monchique", 4. determine the flammable areas that intersect "Monchique"; 5. finally, create a map with those areas with *mapview*.
+
+```{r, eval=TRUE}
+caop.proj<-sf::st_transform(caop, crs=sf::st_crs(flam.sf)) # reproject caop to the CRS of flam.sf
+concelho<-caop.proj[caop.proj$Concelho=="MONCHIQUE",] # select Monchique
+flam.concelho<-sf::st_intersection(flam.sf,concelho) # intersect flammable with Monchique
+mapview(concelho,col.regions="blue")+mapview(flam.concelho,col.regions="green") 
+```
+
+
+
+## Raster data: the *raster* package
+
+Next, we use package *raster* to read and process raster data. This package can deal with very large data sets since it does not need to load the whole data set in memory. If one needs to read a very large file, *raster* can be used to create the connection, and then data can be loaded by blocks of rows with *raster::getValues* and processed one block at the time. 
+
+In the example below the data set is not too big, and therefore it can be loaded in memory. There are three distinct files to be stacked (three bands of a Landsat 8 surface reflectance images over the Alentejo) so *raster::stack* is used to read the list of file names. Then, the stack is converted into a multiband single image with *raster:brick*. Note that building a brick (instead of reading a native multilayer tif file) creates an object "in memory" which can be problematic for very large data sets.
+
+```{r}
+system.time({s<-raster::stack(as.list(file.path(getwd(),"datasets",
+                                        c("LC82030332014151LGN00_sr_band3.tif",
+                                        "LC82030332014151LGN00_sr_band4.tif",
+                                        "LC82030332014151LGN00_sr_band5.tif"))))}) 
+raster::inMemory(s) #FALSE
+system.time({b<-raster::brick(s)}) # takes some time
+raster::inMemory(b) #TRUE
+writeRaster(b,"b.tif",overwrite=TRUE) # creates multilayer file
+b2<-brick("b.tif")
+raster::inMemory(b2) #FALSE
+b
+```
+
+
+
+The number of pixels in the image can be accessed with *ncell(b)*. In this case it is `r prettyNum(raster::ncell(b))`. Bands can be combined to compute indices or can be displayed as RGB color composites (for instance with *mapview::viewRGB*). Landsat 8 surface reflectance values are not supposed to be smaller than 0 or larger than 10000, so we assign *NA* to those pixels, before computing the index *ndvi*.
+```{r}
+b[b<=0 | b>10000]<-NA # non valid values
+ndvi<-(b[[3]]-b[[2]])/(b[[3]]+b[[2]])
+writeRaster(ndvi,file="ndvi.tif",overwrite=TRUE)
+```
+Although *raster* is a very useful and convenient package, namely because it manages available memory very well, some of its functions are not very efficient. So, one might prefer to use alternative packages for some time consuming operations, as long as the data can be loaded into memory.
+
+
+
+The *velox* package provides an alternative to package *raster*. It represents bands as matrices, so unlike *raster* it always loads all pixel values in memory. 
+```{r}
+system.time({s<-raster::stack(as.list(file.path(getwd(),"datasets",c("LC82030332014151LGN00_sr_band3.tif","LC82030332014151LGN00_sr_band4.tif", "LC82030332014151LGN00_sr_band5.tif"))))}) 
+vxs<-velox(s)
+names(vxs$rasterbands)<-c("b3","b4","b5") # each band is a matrix
+```
+
+
+With *velox*, each band needs to be accessed individually. So, for instance, if one wish to apply some function to each band (like converting to NA non valid pixel values) this has to be applied either to each band at the time (alternatively, one could use *lapply*). 
+
+```{r}
+v<-function(x) {x[x<=0 | x>10000]<-NA; return(x)}
+b5<-v(vxs$rasterbands$b5) # assign NA to non valid values
+b4<-v(vxs$rasterbands$b4) # idem
+vals<-(b5-b4)/(b5+b4)
+vxndvi<-velox(vals,extent=vxs$extent,res=vxs$res,crs=vxs$crs)
+```
+
+Available methods for *VeloxRaster* can be listed with *?VeloxRaster*. In particular, velox objects can be converted to *raster* objects.
+```{r}
+r<-vxndvi$as.RasterLayer(band=1)
+mapview(crop(r,r@extent/20)) # center part of image
+```
+The main interest of *VeloxRaster* is to perform some operations on rasters that are slow with tools from package *raster*. For instance, suppose we wish to extract *ndvi* values at *N* random locations. Let's compare the processing time with *raster* and with *velox* and see that *velox* is much faster.
+
+```{r}
+# extract values
+ndvi<-raster("ndvi.tif")
+ext<-as.vector(extent(ndvi))
+N<-10000; locs<-cbind(runif(N,min=ext[1],max=ext[2]),runif(N,min=ext[3],max=ext[4]))
+system.time({x<-raster::extract(ndvi,y=locs)}) # 4.94 for N=10000
+sf.locs<-sf::st_as_sf(data.frame(x=locs[,1],y=locs[,2]), coords = c("x","y") , crs = as.character(crs(ndvi)))
+system.time({y<-vxndvi$extract_points(sf.locs)}) 
+```
+One can check that both functions return the same values, up to d=3 decimal digits.
+
+```{r}
+d<-3;setequal(round(x,d),round(y,d))
+```
+
+In the following example, we compare how long it takes to read the coordinates of the pixels and to crop a raster. Again, we can see that using the best function allows to save time, which can be very relevant for large data sets or for repetitive tasks.
+```{r}
+# read coordinates
+system.time({xy<-coordinates(ndvi)}) # 1.34
+system.time({xy<-vxndvi$getCoordinates()}) # 0.44
+system.time({x<-raster::crop(ndvi,0.5*extent(ndvi))}) # 2.66
+system.time({vxndvi$crop(0.5*extent(ndvi))}) # 0.16 
+```
+
+VeloxRaster objects are *ReferenceClass objects* and thus mutable as explained in <https://www.rdocumentation.org/packages/velox/versions/0.2.0>. This means in particular that one object can be altered without the use of the *<-*  or *=* symbols. For instance, the *crop* operation did re-size *vxndvi*, with the initial version being lost. To make a new copy of the object, one needs to use *$copy*.
+
+```{r}
+vxndvi$extent # after crop
+# original version
+vxndvi<-velox(vals,extent=vxs$extent,res=vxs$res,crs=vxs$crs)
+vxndvi$extent # 
+# make a copy that is not referenced to vxndvi
+vxcopy<-vxndvi$copy()
+```
+
+
+## Maps and colors
+
+Maps, like the ones produced by *plot* or *mapview* have default colors. Usually, one wants to choose a given palette of colors to use and intervals of values that correspond to each color. Argument *at* of *mapview* is used to indicate the breaks in values that correspond to the colors. *R* provides different ways of defining vectors of colors: those are just strings that represent colors using an hexadecimal notation (see <http://www.color-hex.com/>). For instance, color *red* corresponds to code "#ff0000", and *yellow*  has code "#ffff00". There are many ways of defining vectors of colors, including the ones below. Parameter *alpha* in [0,1] indicates transparency, with opaque corresponding to *alpha=1*. 
+
+```{r}
+mycolors<-c("red","yellow","green","blue")
+mycolors<-colorRampPalette(c(rgb(0,0,1,alpha=1), rgb(0,0,1,alpha=0)), alpha = TRUE)(8)
+mycolors<-viridisLite::inferno(n=10,alpha=1,begin=0.2,end=1,direction= -1)
+pie(rep(1,length(mycolors)),col=mycolors)
+```
+
+For instance, if we want to display the *ndvi* map with 4 classes between 0.1 and 1 then we can set the colors and the breaks as in the following example. A description of options for *mapview* can be found <https://environmentalinformatics-marburg.github.io/mapview/advanced/advanced.html>. If the number of colors is lower than the number of intervals, colors are recycled.
+
+```{r}
+mycolors<-colorRampPalette(c(rgb(1,1,0,0.5), rgb(0,1,0,0.5)), alpha = TRUE)(10) # any number >=4
+ndvic<-crop(ndvi,ndvi@extent/20)
+mapview(ndvic,col.regions=mycolors,at=c(0.1,.3,.5,.7,1))
+```
+One can edit data interactively over *mapview* maps (for instance, to create new features) with *mapedit::editMap*. 
+
+## Tables
+
+The simplest structure to represent geographic data is a table: this can be used to represent a set of points, including its coordinates over some known coordinate reference system. There are different packages that allow us to manipulate tables in R. The *base* function *data.frame* and its methods are widely used but can be very slow for large tables. As an alternative, one can use *tibbles* which are an updated approach to *data.frame* functionality (this is part of *tidyverse*, a collection of R packages designed for data science). If we need to use very large tables, the most efficient approach to date in R is package *data.table* as shown   <https://github.com/Rdatatable/data.table/wiki/Benchmarks-%3A-Grouping>.
+
+
+Next we read a data set that contains global active fire data acquired by satellite. We compare the basic utility *read.csv* that returns a *data.frame* with *fread* of package *data.table*. 
+
+```{r}
+#system.time({df<-read.csv(file=file.path(getwd(),"datasets","viirs-fires-2017-world.csv"))}) # 148.41
+system.time({af<-data.table::fread(file.path(getwd(),"datasets","viirs-fires-2017-world.csv"))}) # 14.34 
+af
+```
+
+The output of *fread* is a *data.table* object, which can be queried and explored efficiently. For instance, to select active fires over Continental Portugal, one can use variables longitude and latitude to perform the query. Function *fwrite* creates a new text file.
+
+```{r}
+afpt<-af[latitude>36 & latitude<43 & longitude < -6 & longitude > -10 ]
+data.table::fwrite(afpt,file=file.path(getwd(),"datasets","viirs-fires-2017-portugal.csv"))
+```
+
+New columns can be easily and very efficiently computed. In the example below, the footprint of each observation is computed as the product of the scan and track ground sample distances. Moreover,a *data.table* can be quickly ordered or grouped. An easy introduction to *data.table* can be found in  <https://cran.r-project.org/web/packages/data.table/vignettes/datatable-intro.html>.
+```{r}
+af[,footprint:=scan*track] # create new variable "footprint"
+af[order(frp,decreasing=TRUE)] # order table by frp value
+af[,sum(frp),by=acq_date] # returns table with 365 rows
+af[,s:=sum(frp),by=acq_date] # adds new column to af 
+af[,.N,by=confidence] # a bit faster than >table(af$confidence)
+af[,.(confidence,frp)] # select columns
+```
+
+Note that *data.table* adds/updates/deletes columns *by reference* as explained in <https://cran.r-project.org/web/packages/data.table/vignettes/datatable-reference-semantics.html>. While this speeds-up considerably some operations, in practice it means that one has to be careful when making a  copy of a *data.table* object.
+
+```{r}
+DT<-data.table(x=1:3,y=c(4,8,12))
+newDT<-DT
+newDT[,x:=NULL]
+DT # is modified by reference
+```
+
+To avoid this problem, use function *copy* that creates a *deep copy* of *D* and operates on that copy.
+```{r}
+DT<-data.table(x=1:3,y=c(4,8,12))
+newDT<-copy(DT)
+newDT[,x:=NULL]
+DT # is not modified
+```
+
+## Converting from vector to raster
+
+The goal of *rasterize* is to convert (more precisely, resample) a set of geo-referenced objects into raster format, where the raster can have an arbitrary extent and spatial resolution. Function *rasterize* from *raster* package works with all geometries but is slow for large data sets. 
+
+```{r}
+af<-data.table::fread(file.path(getwd(),"datasets","viirs-fires-2017-world.csv"))
+afpt<-af[latitude>36 & latitude<43 & longitude < -6 & longitude > -10 ] # Continental Portugal
+latlon<-CRS("+proj=longlat +datum=WGS84")
+y<-raster(crs=latlon,resolution=0.01,xmn=-10,xmx=-6,ymn=36,ymx=42) # 0.01 degrees is approx 1 km
+r<-rasterize(x=data.frame(lon=afpt$longitude,lat=afpt$latitude),y=y,field=afpt$frp, fun=max)
+mapview(r)
+```
+
+In the example above, processing time was reasonable because the data set was rather small. If we consider a larger area (Africa), the number of points is much larger and *rasterize* becomes pretty slow.
+
+```{r}
+afaf<-af[latitude > -35 & latitude < 0 & longitude > 0 & longitude < 40] # S Africa
+latlon<-CRS("+proj=longlat +datum=WGS84")
+y<-raster(crs=latlon,resolution=0.01,xmn=0,xmx=40,ymn=-35,ymx=0)
+system.time({r<-rasterize(x=data.frame(lon=afaf$longitude,lat=afaf$latitude),y=y,field=afaf$frp,fun=max)}) #
+```
+
+To speed up this function, perhaps the best option is to run in R algorithms from the Geo-spatial Data Abstraction Library [GDAL](https://www.gdal.org/), available through package *gdalUtils*. However, this uses functions external to R, and installation can be tricky. 
+
+
+For polygons, function *fasterize* from package *fasterize*  is much faster than *rasterize*. The last command compares the resulting raster with the original vector data over the extent of *concelho*. In the example below, the whole flammable area for Portugal is rasterized to resolution RES=50 meters.
+
+```{r}
+flam.sf<-sf::st_read(dsn=file.path(getwd(),"datasets","Flam2015v4.shp"))
+ext<-sf::st_bbox(flam.sf) # select area in the center of Portugal
+RES<-50
+r<-raster(xmn=ext["xmin"],xmx=ext["xmax"],ymn=ext["ymin"],ymx=ext["ymax"],crs=sf::st_crs(flam.sf)$proj4string,resolution=RES)
+system.time({rflam<-fasterize::fasterize(flam.sf,r,field="FID_COS")})
+```
+We show the result with *mapview* just for the region around the administrative unit MONCHIQUE, which is part of the *CAOP2015* data set.
+
+```{r}
+caop<-sf::st_read(dsn=file.path(getwd(),"datasets","Cont_AAD_CAOP2015.shp"),quiet=TRUE)
+caop.proj<-sf::st_transform(caop, crs=sf::st_crs(flam.sf)) # reproject caop
+concelho<-caop.proj[caop.proj$Concelho=="MONCHIQUE",]
+crflam<-raster::crop(rflam,concelho) # crop raster
+cflam<-sf::st_crop(flam.sf,concelho) # crop sf object
+mapview(crflam)+mapview(cflam)
+```
+
+
+# Working example: forest/urban interface
+
+With this example we review some GIS spatial analysis tools that are available through package *sf*. Then, we explore some alternatives that use distances between geographic points to obtain a much faster solution to the problem.
+
+## The COS2015 urban/forest direct interface problem and data
+
+The problem at hand is to determine the so-called *direct interface* between urban and flammable forested areas. The input is a land cover vector map for Portugal (COS2015). Flammable areas are the ones labelled essentially as "floresta", "matos" e "vegetacao esparsa", and the urban areas are the ones labelled as "tecido urbano cont?nuo" (urban), "tecido urbano descont?nuo" (also urban) e "Ind?stria com?rcio e equipamentos gerais" (industry and equipment). The *direct interface* corresponds to the spatial lines where those two types of land cover come together. Supposing that features match spatially, this is just the *intersection* between flammable and urban areas.
+
+We first read the data using *sf_read* from package *sf* (we call call this using *sf::st_read*) to read both *shapefiles* of flammable areas and urban areas for the whole Continental Portugal according to COS2015. Since both data sets were extracted from the same COS2015 land cover map for Continental Portugal, they have the same coordinate reference system.
+
+```{r}
+flam<-sf::st_read(dsn=file.path(getwd(),"datasets","Flam2015v4.shp"))
+urb<-sf::st_read(dsn=file.path(getwd(),"datasets","urb12015v4.shp"))
+```
+
+It is relevant to understand what is the geometry of the spatial information we are going to use. One simple way of doing this is to list the geometry types that are present in each data set. For this data sets, one can conclude that there is only one type of geometry, which is "POLYGON".  
+
+```{r, echo=TRUE}
+table(st_geometry_type(flam))
+table(st_geometry_type(urb))
+```
+
+"POLYGON" geometries differ from "MULTIPOLYGON" in the sense that MULTIPOLYGON is a  collection of POLYGON (MULTIPOLYGON can be *multipart* while POLYGON is  *singlepart*). Moreover, a "POLYGON" is spatially connected but can have "holes" in his interior. 
+
+## Solving the problem with *st_intersection* for a small region of Portugal
+
+Since the full data sets are quite large, let's first look at a subset of the data. In order to do this we consider just one region in Portugal and select the features that intersect that region. It is a good practice to re-project one of the data sets to the coordinate reference system (CRS) of the other data set to guarantee that both data sets are expressed on the same CRS. 
+
+Then, we re-project *caop* to the CRS of *flam*, and we select a particular administrative unit (Marinha Grande)
+
+```{r}
+caop<-sf::st_read(dsn=file.path(getwd(),"datasets","Cont_AAD_CAOP2015.shp"))
+caop.proj<-sf::st_transform(caop, crs=sf::st_crs(flam))
+region<-sf::st_union(caop.proj[caop.proj$Concelho=="MARINHA GRANDE",])
+```
+
+Here, we select just the flammable and urban areas over the region. Toward that end, we perform a *selection by location*, and we select the features that *intersect* the region. In order to do this, we use *sf* method *sf_intersects* (which is distinct from *sf_intersection* that creates new geometries). The output of *sf_intersects* is a logical matrix that indicates which features from each of the inputs intersects spatially. Since *region* has only one feature, the matrix has just one column of *TRUE* and *FALSE*. Then, to select the features from *flam* and *urb* that intersect *region*, we use vector of *TRUE* and *FALSE* to select the rows of the *sf* data.frames. The selected features are called *flams* and *urbs*.
+
+```{r}
+its<-sf::st_intersects(flam,region,sparse=FALSE)
+flams<-flam[its[,1],]
+its<-sf::st_intersects(urb,region,sparse=FALSE)
+urbs<-urb[its[,1],]
+```
+
+Let's see where those features occur with *mapview*.
+
+```{r}
+mapview(flams,col.regions="green")+mapview(urbs,col.regions="gray") 
+```
+
+Next we compute the spatial intersection between *flams* and *urbs* which returns the *direct interface* we were interested in. This is very easy since there is a *sf* method that does it, which is *st_intersection*. 
+
+
+```{r, eval=FALSE}
+system.time({int<-sf::st_intersection(flams,urbs)}) # fast for a small region
+```
+
+Note that the new data set *int* includes different kinds of geometry. for subsequent processing, one could just consider the feature with one particular kind of geometry.
+```{r, eval=FALSE}
+table(st_geometry_type(int))
+int<- int[st_geometry_type(int)=="MULTILINESTRING",]
+```
+
+Finally, we map the result, with red lines indicating the location of the forest-urban interface.
+```{r, eval=FALSE}
+mapview(int,color="red")+mapview(flams,col.regions="green")+mapview(urbs,col.regions="gray")
+```
+
+
+
+## An alternative and much faster approach using distances
+
+As we saw above, the computation time for one region is already sizable, and it would be impractical to process the whole Portugal with *st_intersection*. Next, we explore an alternative, which will lead to a much faster algorithm for the problem at hand.
+
+It is easy to see that the *direct interface* is determined by the vertices of flammable and urban that have the same location.
+
+The key aspect of the approach below is that it uses just the vertices (points) instead of the full polygons that define flammable and urban areas. It relies on function *RANN::nn2* which is extremely efficient to compute distances between points. 
+
+The sequence of steps is the following:
+1. Extract vertices from *flam* and *urb*;
+2. Determine the vertices that have same location (up to a tolerance that we can choose);
+3. From those vertices, built a new feature of geometry *LINESTRING* that connects the vertices that were identified.
+
+```{r}
+xyflam<-sf::st_coordinates(flams)
+xyurb<-sf::st_coordinates(urbs)
+head(xyflam,3)
+```
+
+Note that *xyflam* is a matrix, where the first two columns (named *X* and *Y*) are the coordinates of the vertices. The tow last columns *L1* and *L2* (*L* for level) indicate the level of the feature those points came from. Each feature can have more than one ring: the 1st ring determines the exterior of the feature, and the following rings, if any, determine the "holes" in the feature. For each vertex that was extracted from *flams*, *L2* indicates the index of the feature, and *L1* indicates the ring index*.
+
+```{r}
+nrow(flams) # number of features
+range(xyflam[,"L2"]) # L2 indicates the index of the feature
+```
+
+We  choose one of the data sets (from *flams* and *urbs*) to be the reference for the following steps  to keep note of the indices of the vertices of the reference data set. We choose *urbs* arbitrarily.
+
+```{r}
+xyurb<-cbind(idx=1:nrow(xyurb),xyurb) # idx keeps the index of each original urb vertex
+head(xyurb,3)
+```
+
+The main function (*nn2*) comes next. Given two sets of points A (data) and B (query), it determines, for each single point in B,  what are the closest *k* points in A. The output is a list with two components, where each component is a matrix with number of rows equal to the number of points in B, and number of columns equals to *k*: 
+1. (*\$nn.idx*) a matrix with the indices of the *k* closest points in A;
+2. (*\$nn.dists*) a matrix with the distances to the *k* closest points in A.
+
+We  apply *nn2*  and use *k=1* (we just need the closest point). The output *knn\$nn.idx* has the same number of rows than *xyurb* (the matrix for the *query* argument, which is our reference data set). When one point doesn't have any neighbor within distance determined by *radius*, the index in *knn\$nn.idx* is 0. This gives an easy criterium to remove all vertices or *xyurb* which are not near to some vertex of *xyflam*.
+
+```{r}
+tol<-3 # tolerance
+knn<-RANN::nn2(data=xyflam[,c("X","Y")],query=xyurb[,c("X","Y")],k=1,searchtype = "radius",radius=tol)
+tail(knn$nn.idx,3)
+xyint<-xyurb[knn$nn.idx>0,]
+```
+
+Let's look at the result: this should be a set of vertices of *urb* that are near the vertices of *flamm* and that indicate where the direct interface is.
+
+```{r}
+sfint<-st_as_sf(as.data.frame(xyint), coords = c("X","Y") , crs = st_crs(urb)$proj4string)
+mapview(sfint,color="red")+mapview(flams,col.regions="green")+mapview(urbs,col.regions="gray") 
+```
+
+This could be the answer to the problem if one would just need to determine the locations of interest or even compute some statistics on the direct interface. However, may could want to produce a spatial object of type  *LINESTRING* that could be used to display the result. Moreover, such an object would allow us, for instance, to  compute the total length of the direct interface.
+
+In order to do this, we need to group all  vertices from the same feature, same ring, and same succession of vertices (segment), and then create a *LINESTRING* object from each of the groups.
+
+The information about the feature and ring is available in *sfint* (it comes from *sf::st_coordinates*). The only piece of information that is missing is the one that allow us to break up the succession of vertices into segments, since the interface can be made of several segments of the same ring of the given feature. In order to determine the segments, we use column *idx* of *xyurb* we defined earlier, and we use the fact that one segment is composed of successive vertices, i.e., *idx* increases 1 from one vertex to the next. Below, *jump* is *TRUE* if the increase is larger than 1, which indicates that one should "jump" to the following segment. Using *jump* one can create a new attribute of *sfint* that stores the index of the *segment*. 
+
+```{r}
+jump <- diff(sfint$idx)>1 # indicates if the vertex index "jumps" more than 1 position
+sfint<-cbind(sfint,segment=cumsum(c(0,jump))) # adds columns "segment"
+```
+
+The next command uses *magrittr*'s *pipe* operator. This is a convenient way of applying several functions consecutively: the function after *%>%* uses as its first argument the object before  *%>%* (i.e. *x %>% f(y)* is the same as *f(x,y)*).
+
+```{r}
+fastint<-sfint %>% group_by(L2,L1,segment) %>% summarize(do_union=FALSE) %>% st_cast("LINESTRING")
+mapview(sfint,color="blue")+mapview(fastint,color="red")+mapview(flams,col.regions="green")+mapview(urbs,col.regions="gray")
+```
+
+
+Function *group by* groups vertices according to the values of *L2*, *L1* and *segment*. Function *summarise* is described as *In case one or more of the arguments (expressions) in the summarise call creates a geometry list-column, the first of these will be the (active) geometry of the returned object. If this is not the case, a geometry column is created, depending on the value of do_union*. With *summarise* one can also create new variables that are computed for each group (e.g. the mean of some variable within the group). 
+
+After groups of vertices are defined, a simple way of creating a feature class of type LINESTRING from points is using function *st_cast*, where option *do_union=FALSE* is necessary to preserve the order of the vertices before the cast to LINESTRING.
+
+Finally, one can apply the algorithm to the whole Continental Portugal as below, which should take approximately 10 minutes to run. 
+
+```{r, eval=FALSE}
+system.time({
+xyflam<-st_coordinates(flam)
+xyurb<-st_coordinates(urb)
+xyurb<-cbind(idx=1:nrow(xyurb),xyurb) 
+tol<-3 # tolerance to consider vertices coincident
+knn<-nn2(data=xyflam[,c("X","Y")],query=xyurb[,c("X","Y")],k=1,searchtype = "radius",radius=tol)
+xyint<-xyurb[knn$nn.idx>0,]
+sfint<-st_as_sf(as.data.frame(xyint), coords = c("X","Y") , crs = st_crs(urb)$proj4string)
+jump <- diff(sfint$idx)>1
+sfint<-cbind(sfint,segment=cumsum(c(0,jump)))
+fastint<-sfint %>% group_by(L2,L1,segment) %>% summarize(do_union=FALSE) %>% st_cast("LINESTRING")
+})
+```
+
+
+# Working example: Determining spatial-temporal patches using graphs
+
+
+<!--
+nice tutorial on sf/tidyverse: http://strimas.com/r/tidy-sf/
+-->
+
+In this section, we explore large geographical data sets using *graphs*. The application consists in identifying spatial-temporal patches of active fires derived from satellite imagery. Active fires are observations with strong energy emissions from the surface: they have a date and time of acquisition and a location on the surface. The goal is to find meaningful clusters of those points in space and time and group them into spatial polygons. Each polygon will have a date or range of dates assigned to it, which corresponds to the date of burn. Since Portugal was hit by large fires in 2017, we use active fires over Continental Portugal for this example.
+
+## Problem: determining meaningful spatial-temporal patches of active fires 
+
+Recall the approximate distribution of satellite (VIIRS) active fire observations over Portugal in 2017 at the beginning of Section 2.5: it gives some idea of the spatial distribution of fires but doesn't distinguish dates. The goal of the problem at hand is to determine meaningful spatial-temporal patches of fire activity. Toward that end, we will look for clusters of active fires. Let's first read the data and restrict the observations to a particular region.
+
+```{r, eval=FALSE, echo=FALSE}
+af<-data.table::fread(file.path(getwd(),"datasets","viirs-fires-2017-world.csv"))
+afpt<-af[latitude>36 & latitude<43 & longitude < -6 & longitude > -10 ] # Continental Portugal
+```
+
+```{r, eval=FALSE, echo=FALSE}
+af<-data.table::fread(file.path(getwd(),"datasets","viirs-fires-2017-world.csv"))
+afpt<-af[latitude>36 & latitude<43 & longitude < -6 & longitude > -10 ] # Continental Portugal
+latlon<-CRS("+proj=longlat +datum=WGS84")
+y<-raster(crs=latlon,resolution=0.01,xmn=-10,xmx=-6,ymn=36,ymx=42)
+r<-rasterize(x=data.frame(lon=afpt$longitude,lat=afpt$latitude),y=y,field=afpt$frp, fun=max)
+mapview(r)
+```
+
+Next, we  convert the dates in the active fire data set into Julian dates. For *date::as.date* the starting day is January 1, 1960, although the precise reference date is irrelevant for our example. One could additionally take into account the time of acquisition available in the file and create a time in hours or minutes for each active fires. We are not going to do that to keep the example as simple as possible.
+
+```{r}
+dt<-date::as.date(x=afpt$acq_date, order = "ymd") %>% as.integer()
+hist(dt, xlab="Julian dates (starting January 1, 1960)", ylab="number of active fires", main="VIIRS active fires: Portugal 2017")
+```
+
+We have three dimensions: one is time, which is measured in days, and the other two are in space. To measure distances on the surface, one should avoid geographic coordinates an re-project the data onto a local coordinate reference system as the official CRS for Portugal (PT-TM06/ETRS89, EPSG:3763).
+
+To make the sequence of operations easier to follow, we use *magrittr*'s pipe operator for chaining commands.
+
+```{r}
+sfpt<- as.data.frame(afpt) %>% st_as_sf(coords = c("longitude","latitude") , crs = 4326) %>% st_transform(crs=3763)
+```
+
+## Determining spatial distances between active fires
+
+Spatial-temporal patches depend on the distance between active fires. Since coordinates are now in meters, we set the parameter *d* with a value in meters. For the time dimension, we define a maximum time gap *t* between active fires.
+
+```{r}
+d<-2000 # meters
+t<-2 # days
+K<-20 # neighbors to consider
+```
+Next we build a graph which vertices represent active fires. In the graph, active fires are going to be connected if the distance between them is shorter than *d* and if the tile gap is not larger than *t*. We start by determining the list of edges that connect vertices. This is going to be ultimately represented by a *data.table* with columns *v1* and *v2*, where each pair *(v1,v2)* represents an edge in the graph.
+
+```{r}
+knn<-RANN::nn2(data=st_coordinates(sfpt),k=K,searchtype="radius",radius=d)
+head(knn$nn.idx[,1:10],5)
+head(knn$nn.dists[,1:5],3)
+```
+
+Note that the distance to the nearest neighbor is always 0. This is because in general the nearest neighbor is the vertex itself (if there are two vertices with precisely the same coordinates, the nearest neighbor can be a distinct vertex, but the distance is still 0). The next step is to determine all the edges between neighbor observations. 
+
+In order to do this we rearrange the columns of *knn$nn.idx*. The first command is to create a first column with the indices of all observations (*1,2,3...*). The next command moves down to the second column of *edges* all neighbors, so the resulting matrix *edges* has just two columns, where the first column has the indices of the observations (repeated *K=ncol(neigh)* times), and the second column has the respective *j-th* neighbor.
+
+```{r}
+neigh<-cbind(1:nrow(knn$nn.idx),knn$nn.idx)
+head(neigh[,1:10],4)
+edges<-data.table(v1=rep(neigh[,1],ncol(neigh)-1),v2=as.vector(neigh[,-1]))
+dim(edges)
+```
+At this point, one should remove pairs where one vertex is missing (in that case the index in the second column is 0).
+
+```{r}
+edges[v2==0] # non edges
+edges<-edges[v2!=0] # remove non edges
+```
+
+## Adding temporal constraints
+
+So far, we only used spatial coordinates, but we want our patches to satisfy a temporal restriction as well. As mentioned above, two active fires should be connected only if their acquisition dates differs at most by *t* days. In order to enforce this, we first need to add to our matrix the acquisition dates available in vector *dt*. Note, and this is a key aspect of the construction, that observations are indexed as in the original data set (the same order and length). Therefore the index of each observation in *edges* is precisely the same index than in *dt*. 
+
+```{r}
+edges[,d1:=dt[v1]] # acquisition dates
+edges[,d2:=dt[v2]] # acquisition dates
+edges<-edges[abs(d1-d2)<=t]
+```
+Just for sake of clarity, we also add the information about the coordinates of the observations, although this is not necessary for the task at hand.
+```{r}
+xy<-st_coordinates(sfpt) # for clarity, but optional
+edges[,x1:=xy[v1,"X"]] # coordinates, optional
+edges[,y1:=xy[v1,"Y"]] # coordinates, optional
+edges[,x2:=xy[v2,"X"]] # coordinates, optional
+edges[,y2:=xy[v2,"Y"]] # coordinates, optional
+tail(edges,3)
+```
+
+Let's double check that all distances are within  *d* and that all date gaps are within *t*:
+```{r}
+max(edges[,sqrt((x1-x2)^2+(y1-y2)^2)])
+max(edges[,abs(d1-d2)])
+sum(duplicated(edges)) # check that there are no duplicated edges
+```
+
+## Building and exploring the graph
+
+We have now a list of `r nrow(edges)` edges and we can build a graph that represents active fires and their proximity relations. There are many types of graphs, including *directed* and *undirected* graphs. In our case, we only need an *undirected graph*, where the directions on the edges are not relevant. Note that the construction above doesn't guarantee that there are no multiple edges (i.e. two edges *(v1,v2)* and *(v2,v1)*). We could remove those edges directly from data.table *edges* but it is better to use available functions from package igraph <http://igraph.org/r/doc/index.html> which are properly designed for that goal. In our case, we use function *igraph::simplify* that removes loops and multiple edges.
+
+An introduction about drawing graphs with *igraph* can be found [here](http://igraph.org/r/doc/plot.common.html). 
+
+```{r}
+Gall<-igraph::graph_from_data_frame(d=edges,directed=FALSE) 
+G<-igraph::simplify(Gall) # removes loops and multiple edges
+```
+
+Let's just confirm that the names of the vertices in the graph correspond to the indices of the vertices in the table *edges*.
+
+```{r}
+v<-as.integer(igraph::vertex_attr(G)$name) # vertex names
+range(v)== range(edges[,.(v1,v2)]) # confirm index numering
+```
+
+We can add an attribute that indicates the active fire acquisition date and time for each vertex of the graph. This is done with *set_vertex_attr*. Similarly, one could use *set_edge_atrib* to create an attribute for edges.
+
+We also label each vertex with  the FRP (Fire Radiative Power, expressed in Mega Watts) and the *x,y* coordinates. Although the *x,y* coordinates are not required anymore after the topology of the graph is defined, we add those coordinates as vertex attributes so we can use them later to plot the graph with a layout that corresponds to the spatial locations of the vertices (which represent active fires).
+
+```{r}
+G<-igraph::set_vertex_attr(G,name="date",value=sfpt$acq_date) # 
+G<-igraph::set_vertex_attr(G,name="time",value=sfpt$acq_time) # 
+G<-igraph::set_vertex_attr(G,name="FRP",value=sfpt$frp) # 
+xy<-sf::st_coordinates(sfpt)
+G<-igraph::set_vertex_attr(G,name="x",value=xy[,1]) # 
+G<-igraph::set_vertex_attr(G,name="y",value=xy[,2]) # 
+summary(G) # U for "undirected"; N for "named"
+```
+
+
+Next, we use a *igraph* function that returns the connected components in *G*. Those are the clusters of vertices that are connected in the graph. Notice that the result is a named vector with one value per vertex: the name is the name of the vertex (of character type) and the value is the component number. This tell us what is the component for each vertex.As we did above, we can add a new vertex attribute with the cluster number.
+
+
+```{r}
+CL<-igraph::components(G)
+head(CL$membership,15) # returns vertice name and vertice cluster
+G<-igraph::set_vertex_attr(G,name="cluster",value=CL$membership)
+```
+
+Let's consider one component of the graph and see what it looks like. It contains all vertices in that component and the edges between them. Function *induced_graph* returns the sub-graph with a subset of edges and all connections between them. *V(G)* returns the vertices of *G*
+
+```{r}
+idxcomp<-2500 # the index of one cluster
+# subgraph
+S<-igraph::induced_subgraph(G,V(G)[cluster == idxcomp])
+```
+We can plot the graph, and add to the plot additional information using labels and colors. Here, we label each vertex with the active fire acquisition date, and we color each vertex according to the FRP rank. A vertex attribute (e.g. color) can be set for the graph with *set.vertex.attribute*. In alternative, the attribute can be set as a *plot* option.
+
+```{r}
+# colors for subgraph: depending on FRP
+mycolors<-colorRampPalette(c(rgb(1,1,0), rgb(1,0,0)))(length(V(S)))[order(V(S)$FRP)]
+S <- igraph::set_vertex_attr(S, "color", value=mycolors)
+# color is a new attribute
+igraph::vertex_attr_names(S)
+```
+
+Plotting defining labels and colors for the vertices, and a layout that uses the geographic locations.
+```{r}
+plot(S,layout=cbind(V(S)$x,V(S)$y),vertex.label=V(S)$date,vertex.size=30,vertex.color=V(S)$color)
+plot(S,layout=cbind(V(S)$x,V(S)$y),vertex.label=V(S)$time,vertex.size=30,vertex.color=V(S)$color)
+```
+  
+## Mapping spatial-temporal clusters of active fires 
+
+Let's go back to our *sf* object and add the information about the clusters in *sfpt*. This is very easy to do since it is just a new column with the cluster membership. Note that this works because the graph *G* was originally derived from the table *edges*, which, in turn, was build from all points in *sfpt*. Therefore, the vertex' indices match the rows of *sfpt*. For sake of clarity, we define recall how to derive the graph from adjacency matrix *edges*, determine connected components and then we show how to incorporate that information back into the spatial object *sfpt*.
+
+```{r}
+Gall<-igraph::graph_from_data_frame(d=edges,directed=FALSE) 
+G<-igraph::simplify(Gall) # removes loops and multiple edges
+CL<-igraph::components(G) # connected components
+sfpt$clust<-CL$membership # update sfpt
+```
+  
+Let's then make the first map of spatial temporal patches. Here we assign the same color to all points that belong to the same patch, so we can visualize them in the map. We use random colors to make it unlikely that two neighbor patches have similar colors. The expression with the modulo operator maps the full set of indices into numbers from 1 to n. 
+  
+```{r}
+n <- 10
+palette <- randomcoloR::distinctColorPalette(n)
+mapview(sfpt,zcol="clust",col.regions =palette[1+sfpt$clust%%n],cex=4,lwd=0)
+```
+  
+
+```{r, echo=FALSE}
+#knitr::knit_exit()
+```
+  
+Below, we consider a more sophisticated way of determining clusters: instead of considering connected components, we use the Louvain algorithm that returns "dense" components. The map shows that this prevents long clusters with weak connections from occurring. Notice that the only difference with what we did earlier is replacing *components(G)* by *cluster_louvain(G)* since the graph is the same, and only the decomposition algorithm changes. In the map, we compare both results and we can see the result of creating "dense components" instead of the simplest form of "connected components".
+  
+```{r}
+# Louvain
+CLlouvain<-igraph::cluster_louvain(G) # returns community object; can use positive weights
+sfpt2<-sfpt # make a copy of sfpt for mapview
+sfpt2$clust<-CLlouvain$membership
+```
+
+To map the new result with *mapview* and compare both solutions, we apply mapview twice.
+  
+```{r,eval=FALSE}
+mapview(sfpt,zcol="clust",col.regions =palette[1+sfpt$clust%%n],cex=4,lwd=0)+mapview(sfpt2,zcol="clust",col.regions =palette[1+sfpt2$clust%%n],cex=4,lwd=0)
+```
+
+## Converting clusters of active fires into polygon type features
+
+Finally, we might want to represent the clusters as polygons (instead of points). We first convert  with *st_cast* our original points into MULTIPOINT features, where each feature contains all points that belong to a cluster. Next, we select  features with at least three points (otherwise the polygons would be ill-defined). Function *summarize* below is used to determine the most frequent (the mode) date in each group (variable *date*), and the number of active fires per group (variable *N*). 
+  
+```{r}
+sfmpt<-sfpt2 %>% group_by(clust) %>% summarize(date=raster::modal(acq_date), N=length(acq_date),do_union=TRUE) %>% st_cast(to="MULTIPOINT")
+# number points in each feature
+dimfeat<-sapply(st_geometry(sfmpt),function(x) length(x))
+sfmpt3<-sfmpt[dimfeat>=6,] # two coordinates per point
+```
+
+There are many ways to create polygons from sets of points. The most direct way is to compute what is called the *convex hull*, which is the smallest convex polygon that contain all the points. R has a very efficient function to do this which is named *chull*. This function gets as input a set of points (represented by a two column matrix) and returns the subset of those points that define the convex hull. Since *chull* is applied just to the coordinates (not to the spatial object of call *sf*), we define a function that reads a *MULTIPOINT* feature, extracts the coordinates, applies *chull*, and returns a polygon spatial object.
+
+```{r}
+fconv<-function(feat) 
+{
+  xy<-st_coordinates(feat)[,c("X","Y")];
+  pol<-xy[chull(xy),];
+  st_polygon(list(rbind(pol,pol[1,]))) # the first and last have to be equal
+}
+```
+Now, we just need to apply *fconv* to all our clusters of points. Since the geometry of a *sf* object is a list of geometries, we want to apply *fconv* to each element of the list returned by *st_geometry(sfmpt3)*, where *sfmpt3* is our *MULTIPOINT* spatial object that contains all clusters with at least three points. This is done with *lapply* that reads a list, applies function *FUN* to each element of the list, and then returns the new list of the results. 
+
+Creating the new object *sfconv* of geometric type POLYGON can be done in a multitude of ways. Here, we first make a copy of the existing MULTIPOINT object *sfmpt3* and replace its geometry, leaving the attribute table and the coordinate reference system unchanged.
+
+```{r}
+sfconv<-sfmpt3 # make a copy
+# replace geometry by a polygon geometry applying convex hull to the groups of points
+st_geometry(sfconv)<-st_sfc(lapply(st_geometry(sfmpt3),FUN=fconv), crs=st_crs(sfmpt3)$proj4string)
+``` 
+
+Next, we superimpose the convex hulls of the patches and the individual active fires observations for the largest convex polygon in *sfconv*.
+```{r,eval=FALSE}
+idx<-which.max(st_area(sfconv))
+mapview(sfconv[idx,])+mapview(st_crop(sfpt2,st_bbox(sfconv[idx,])),zcol="clust",col.regions =palette[1+sfpt2$clust%%n],cex=4,lwd=0)
+``` 
+
+The problem with determining the convex hull it that, usually, patches are not convex, so convex hulls tend to over evaluate the actual area of the patch of points. We can replace *chull* by a function that return what is called a *concave hull*. The concave hull is not uniquely defined as the convex hull is, so it depends on a  parameter that determines how "deep" the concave hull penetrates into the convex hull.
+
+Package *concaveman* implements the fast algorithm [Park and Ho, 2012](http://www.iis.sinica.edu.tw/page/jise/2012/201205_10.pdf) for concave hulls. The parameter *concavity* varies from 1 to infinity and is 2 by default. Large values of the parameter approach the convex hull solution.  Below, we replace function  *chull* by function *concaveman* from package with the same name.
+  
+```{r}
+fconc<-function(feat) 
+{
+  xy<-st_coordinates(feat)[,c("X","Y")];
+  pol<-concaveman::concaveman(xy,concavity=3);
+  st_polygon(list(rbind(pol,pol[1,])))
+}
+sfconc<-sfmpt3 # make a copy
+st_geometry(sfconc)<-st_sfc(lapply(st_geometry(sfmpt3),FUN=fconc), crs=st_crs(sfmpt3)$proj4string)
+```
+
+Again, we show the result just for the largest cluster.
+```{r}
+idx<-which.max(st_area(sfconc))
+mapview(sfconc[idx,])+mapview(st_crop(sfpt2,st_bbox(sfconc[idx,])),zcol="clust",col.regions =palette[1+sfpt2$clust%%n],cex=4,lwd=0)
+```
+
+
+## Comparison with the actual map of burned areas for Portugal in 2017
+
+We look at the result and compare with the actual map of burned areas in Portugal for 2017, which are plotted using random colors. There are some main differences at locations where active fires are not available due to cloud cover or smoke plumes.We define *ext* to plot the results just for the northern part of Portugal.
+
+```{r}
+aa<-sf::st_read(file.path(getwd(),"datasets","Areas_Ardidas_2017_Portugal_Continental_v1.shp"),quiet=TRUE)
+ext<-sf::st_bbox(aa); ext["ymin"]<-0; ext["xmax"]<-ext["xmax"]/2
+n <- 20
+palette <- randomcoloR::distinctColorPalette(n)
+mapview(st_crop(sfpt2,ext),col.regions=palette[1+sfpt2$clust%%n],cex=4,layer.name="active fires")+mapview(st_crop(aa,ext),col.regions=palette,layer.name="burned areas")+mapview(st_crop(sfconc,ext),col.regions="gray", layer.name="s-p patches")
+``` 
+
+Let's validate numerically those results. If we consider that the burned area map *aa* is the correct reference, we would like to know what is the proportion of the actual burned area that is classified as correct by the simple active fire based algorithm, and the area that is wrongly classified as burned by the active fire algorithm. In short, we want to compute a *error matrix* with two rows (burned and unburned according to the reference) and two columns (burned or not burned according to the active fire classification) that give all the relevant information.
+
+One possibility to do this is to compute the intersection (with *st_intersection*) and the differences (with *st_difference*) and then compute the resulting areas with *st_area*. However, this is typically slow for a large number of polygons.
+
+A much faster alternative is to compute an approximation of those areas by first rasterizing the polygons. In order to do that, we first create an empty raster with a given resolution (here it is 0.0005 degrees, which is approximately 50 m). Bellow, we start by defining the raster over geographic coordinates since we know the extent we want to consider, but we could have started with cartographic coordinates right away. Function *st_transform* is applied to ensure that *aa* and *sfconc* have the same CRS.
+
+```{r}
+latlon<-"+proj=longlat +datum=WGS84"
+RES<-0.0005
+r<-raster(crs=latlon,resolution=RES,xmn=-10,xmx=-6,ymn=36,ymx=42)
+r<-projectRaster(from=r, crs=CRS(st_crs(aa)$proj4string))
+sfconc<-st_transform(sfconc,crs=st_crs(aa)$proj4string)
+```
+
+The next step is to rasterize both polygon data sets. This can be done very efficiently by *fasterize*. To apply it, we first create a column with values 1, so *fasterize* assigns that value to the pixels that overlap the polygons.  
+
+```{r}
+system.time({
+sfconc$new<-1
+rconc<-fasterize::fasterize(sf=sfconc,raster=r,field="new",fun="max",background=0)
+aa$new<-1
+raa<-fasterize::fasterize(sf=aa,raster=r,field="new",fun="max",background=0)
+})
+```
+
+Finally, we need to count how many pixels occur in each of the four possible combinations. This can be done very easily and quickly using a *data.table*, and grouping it by the possible values of *aa* and *conc*. This should take less than 10 seconds for approximately  100 million pixels.
+
+```{r}
+DT<-data.table(aa=values(raa),conc=values(rconc))
+DT[,.N,by=.(aa,conc)]
+```
+If we want a more precise estimate, we can reduce the resolution o raster *r* and repeat the procedure.
+
+
+```{r, echo=FALSE}
+#knitr::knit_exit()
+```
+
+# Appendix
+
+## Test *fasterize*
+
+The documentation on package *fasterize* is scarse and therefore it's not clear when a pixel of the raster is selected. Below we do a small experiment that shows that the criterium is the usual one: the pixel is selected if its *center* is within some polygon of the data set to be rasterized.
+
+First we create a *sf* object of POLYGON geometric type.
+```{r}
+mypol<-st_polygon(list(rbind(c(0,0),c(2,0),c(1.4,0.5),c(9,8.8),c(9.6,9.5),c(9,10),c(0,10),c(0,0))))
+mysfc<-st_sfc(mypol)
+mysf<-st_sf(new=1,mysfc)
+```
+
+Then, we create a simple raster with 10 rows and 10 columns.
+
+```{r}
+r<-raster(resolution=1,xmn=0,xmx=10,ymn=0,ymx=10)
+values(r)<-0
+```
+
+Finally, we apply *fasterize* and plot the result. Clearly, only pixels which center is contained in *mysf* are selected.
+```{r}
+plot(fasterize::fasterize(mysf,raster=r,field="new"),col=rgb(0,1,0,0.2),legend=FALSE)
+plot(mysf,color=rgb(1,0,0,0.2),add=TRUE)
+points(1.5,.5)
+points(9.5,9.5)
+for (i in 0:10) abline(v=i)
+for (i in 0:10) abline(h=i)
+```
+
+## Create graph directly from a spatial data set with *stplanr* and visualize graph solutions with *mapview*
+
+Earlier, we built a graph from an adjacency matrix, which is a good approach for very large data sets. However, there is a more direct approach to convert spatial data sets into graphs. In this example, we read a shapefile of roads and build a graph using package *stplanr*. Then, we explore the graph with *igraph* and plot the output with *mapview*. The problem at hand is finding the shortest path on the road network using two criteria: length and duration.
+
+Let's first consider a toy example to understand how a *sf* object with type of geometry LINESTRING can be converted into a graph with *stplanr*. We first define 4 features, and the corresponding *sf* object:
+
+```{r}
+L1<-st_linestring(matrix(c(0,0,0.5,1,2,0,0,0),ncol=2))
+L2<-st_linestring(matrix(c(1,2.5,0,0),ncol=2))
+L3<-st_linestring(matrix(c(1,1,0,2),ncol=2))
+L4<-st_linestring(matrix(c(2,2,1,2),ncol=2))
+mysfc<-st_sfc(list(L1,L2,L3,L4))
+mysf<-st_sf(mysfc)
+plot(mysf)
+```
+
+The object *mysf* above has the right topology since  each feature of *mysf* is an edge of the graph. In particular, features of *mysf* only intersects at their ends. Therefore, one can apply *stplanr::SpatialLinesNetwork* which converts each feature of *mysf* into an edge of the graph. In fact, the output of *stplanr::SpatialLinesNetwork(mysf)* is an object with several *slots*. Slot *@g* contains the *igraph* object. Given *G*, we can add attributes to its vertices or its edges. Here, we add attribute *name*, and then we plot *G* using the coordinates available in *G$x* and *G$y*. The edge attribute *E(G)$weight* is returned by *stplanr::SpatialLinesNetwork*: it is the length of each feature of  *mysf*. 
+
+```{r}
+network<-stplanr::SpatialLinesNetwork(mysf)
+G<-network@g
+V(G)$name<-letters[1:6]
+# G$x and G$y are coordinates of the vertices
+# plot G, names of vertices and weights of edges:
+plot(G,layout=cbind(G$x,G$y),vertex.size=40, vertex.label=V(G)$name,edge.label=E(G)$weight)
+```
+
+Now, we can explore *G*, and, for instance, the solution of some problem over *G*  might end up being the sub-graph of *G* induced by the  1st edge (a,b) and the 3rd edge (b,d). If we want to plot the *sf* object that corresponds to that subgraph, we just have to select the 1st and 3rd features of  *mysf* since there is a 1 to 1 correspondance between features of *mysf* and edges of *G*.
+```{r}
+E(G)
+plot(mysf[c(1,3),])
+```
+
+## Create graph directly from a spatial data set with *stplanr*: real example
+
+
+Let's read and look at a the data. This is a road network for the administative unit of Cascais. There are four types of road: highways (A), main roads (P), secondary roads (S) and minor roads (C).
+
+```{r}
+roads<-sf::st_read("Roads.shp") # input of format shapefile
+sf::st_crs(roads)<-20790 # correct CRS
+mapview::mapview(roads,zcol="Tipo")
+```
+
+The next step is to build the graph. Function *SpatialLinesNetwork* reads a spatial object and creates a graph *G* where each edge corresponds to a feature of *roads*.  The vertices are the points where features come together. Note that *SpatialLinesNetwork* allows to establish a tolerance distance to define vertices. However, that option may change the order of the features, which is problematic if we want to relate the edges of the graph with the features in the original spatial data set. 
+
+```{r}
+network<-stplanr::SpatialLinesNetwork(roads,tolerance=0)
+G<-network@g
+plot(G,layout=cbind(G$x,G$y),vertex.size=4, vertex.label="") # G$x and G$y are coordinates of vertices
+```
+
+We add two new attribute to the edges of *G*: length is simply the length (in meters) if the edge, which is automatically compuuted by *SpatialLinesNetwork*  and stored in an attribute called *weight*. The other attribute is the duration for each edge, which is the duration (in minutes) to drive along the edge at maximum allowed speed (defined in table *maxspeed*).
+
+```{r}
+E(G)$length<-E(G)$weight # in m
+maxspeed<-data.frame(type=c("A","P","C","S"),km.h=c(120,90,60,40))
+roads2<-merge(roads,maxspeed,by.x="Tipo",by.y="type")
+E(G)$duration<-60*E(G)$weight/(roads2$km.h*1000) # in minutes
+names(edge_attr(G))
+```
+Finally, we choose two vertices and compute the shortest path according to length and according to duration. Function *shortest path* returns the list of edges (*epath*) and we use *unlist* to obtain the indices of those edges. Then we can visulaize the subset of features of the network that correspond to the selected edges with *mapview*.
+
+
+```{r}
+V1<-213; V2<-950 # two arbitrary vertices
+slength<-unlist(igraph::shortest_paths(G, from=V1, to = V2, weights=E(G)$length,output="epath")$epath)
+sduration<-unlist(igraph::shortest_paths(G, from=V1, to = V2, weights=E(G)$duration,output="epath")$epath)
+mapview(roads,zcol="Tipo")+mapview(roads[slength,],color="orange",lwd=7)+mapview(roads[sduration,],color="red",lwd=5)
+```
+
+```{r,echo=FALSE, eval=FALSE}
+aa<-st_read(file.path(getwd(),"datasets","Areas_Ardidas_2017_Portugal_Continental_v1.shp"),quiet=TRUE)
+save(aa,sfpt2,sfconc,sfconv,file="patches.RData")
+#setwd("\\\\pinea\\mlc\\Aulas\\CURSOS_R\\isa-setembro-2018-grandes-cdg\\aulas") 
+load("patches.RData")
+library("htmlwidgets")
+library(mapview)
+library(sf)
+library("randomcoloR")
+n <- 20
+palette <- distinctColorPalette(n)
+mycolors<-rep(palette,times=max(sfpt2$clust)/n)
+aa<-st_read(file.path(getwd(),"datasets","Areas_Ardidas_2017_Portugal_Continental_v1.shp"),quiet=TRUE)
+m<-mapview(sfpt2,color=mycolors[sfpt2$clust],cex=4)+mapview(aa,col.regions=distinctColorPalette(20))+mapview(sfconc,col.regions="gray")
+# create html file from map m
+saveWidget(m@map, file="areas_ardidas_pt_2017.html", selfcontained = FALSE) 
+```
